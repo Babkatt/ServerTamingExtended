@@ -1,0 +1,17 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Build outputs
+bin/
+obj/
+Debug/
+Release/
+
+# Local build configuration
+Local.Build.props
+
+# Temporary files
+*.tmp
+*.bak

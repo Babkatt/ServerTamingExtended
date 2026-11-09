@@ -1,0 +1,9 @@
+﻿{
+  "name": "ServerTamingExtended",
+  "version_number": "1.0.0",
+  "website_url": "https://github.com/Babkatt/ServerTamingExtended",
+  "description": "Server-only taming and breeding for deer, necks, and seals, including seal pups, automatic feeding, and optional Valheim Server UI integration.",
+  "dependencies": [
+    "denikson-BepInExPack_Valheim-5.4.2202"
+  ]
+}
