@@ -77,7 +77,7 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include=".gitignore" />
-    <Content Include="LICENSE.txt" />
+    <None Include="LICENSE" />
     <None Include="CHANGELOG.md" />
     <None Include="manifest.json" />
     <None Include="README.md" />
