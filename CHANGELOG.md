@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to ServerTamingExtended will be documented here.
 

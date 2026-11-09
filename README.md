@@ -1,4 +1,4 @@
-﻿# ServerTamingExtended
+# ServerTamingExtended
 
 A server-side BepInEx mod for Valheim that makes deer, necks, and seals tameable and breedable, with additional feeding options and optional integration with Valheim Server UI and ServersideQoL.
 
