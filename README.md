@@ -1,6 +1,7 @@
+
 # ServerTamingExtended
 
-A server-side BepInEx mod for Valheim that makes deer, necks, and seals tameable and breedable, with additional feeding options and optional integration with Valheim Server UI and ServersideQoL.
+A server-side BepInEx mod for Valheim that makes deer, necks, and seals tameable and breedable, with additional feeding options, optional seal star breeding, and optional integration with Valheim Server UI and ServersideQoL.
 
 **Dedicated server only — no client installation required.**
 
@@ -20,10 +21,42 @@ Based on [ServerTaming by Shuiei](https://github.com/Shuiei/valheim-server-tamin
 
 - Breed tamed deer, necks, and seals.
 - Configurable breeding intervals, pregnancy duration, population limits, and partner distance.
-- Offspring inherit their parent's star level.
+- Offspring normally inherit their parent's star level.
 - Deer and neck offspring spawn as adults.
 - Seals produce vanilla `Seal_Pup` offspring that mature into adults after a configurable period.
+- Seal pups retain their star level when maturing.
 - Seal pups count toward breeding population limits.
+
+### Seal star breeding (v1.1.0)
+
+Optional star upgrades and selective breeding for seal offspring.
+
+**Star upgrades are disabled by default.** With the feature disabled, offspring inherit their parent's star level as before.
+
+When `EnableStarUpgrades` is enabled:
+
+- Seal offspring have a configurable chance to gain one additional star above their parent's level.
+- The maximum offspring star level is configurable.
+- Star upgrades apply only to seals; deer and neck breeding is unchanged.
+- Upgrades work without enabling selective breeding.
+
+When `SelectiveStarBreeding` is also enabled:
+
+- A configurable limit controls how many 2-star-or-higher seals may be present within a specified radius before further high-star births are restricted.
+- Both adult seals and seal pups count toward this limit.
+- Once the limit is reached, new offspring are restricted to 0 stars, with a configurable chance of being born at 1 star instead.
+- Existing seals are never removed or downgraded when the limit is reached.
+- If the nearby high-star population drops below the limit, higher-star offspring can be produced again.
+- The selective breeding limit is separate from normal creature population limits.
+
+For example, with a 100% star upgrade chance and a maximum of 2 stars:
+
+- A 0-star parent can produce a 1-star pup.
+- A 1-star parent can produce a 2-star pup.
+- A 2-star parent produces offspring capped at 2 stars.
+- With selective breeding enabled and the local 2-star quota reached, subsequent offspring follow the configured fallback chance instead.
+
+**Selective breeding does not need to be enabled to use star upgrades.** Disabling selective breeding removes the star-specific population quota, but normal breeding population limits still apply.
 
 ### Feeding
 
@@ -135,6 +168,65 @@ Default foods:
 
 The `Seal` section also includes `PupGrowMinutes`, which controls the maturation time for seal offspring.
 
+### Seal star breeding settings (v1.1.0)
+
+All settings are located in the `[Seal]` configuration section.
+
+| Setting | Default | Description |
+|---|---|---|
+| EnableStarUpgrades | false | Enable the possibility of seal offspring gaining additional stars |
+| SelectiveStarBreeding | false | Enable the nearby high-star population quota |
+| StarUpgradeChance | 5 | Percentage chance for offspring to gain one additional star |
+| MaxOffspringStars | 2 | Maximum number of stars a seal offspring may have when star upgrades are enabled |
+| MaxTwoStarSeals | 2 | Maximum number of nearby seals with 2 or more stars before selective breeding restrictions apply |
+| StarCheckRadius | 15 | Radius in metres used to count nearby high-star seals |
+| AtCapacityOneStarChance | 5 | Percentage chance of a 1-star offspring instead of a 0-star offspring when the high-star quota is reached |
+
+#### Configuration dependencies
+
+`EnableStarUpgrades` is the primary toggle.
+
+- When `EnableStarUpgrades = false`, all new star-breeding behavior is disabled and normal inheritance is preserved.
+- When `EnableStarUpgrades = true`, `StarUpgradeChance` and `MaxOffspringStars` control offspring upgrades.
+- When `SelectiveStarBreeding = false`, star upgrades are unrestricted by the star-specific population quota.
+- When both toggles are enabled, `MaxTwoStarSeals`, `StarCheckRadius`, and `AtCapacityOneStarChance` also take effect.
+
+The star-specific quota limits new births, not existing animals. It does not replace the normal breeding population limit.
+
+#### Example: Unrestricted star upgrades
+
+```ini
+[Seal]
+EnableStarUpgrades = true
+SelectiveStarBreeding = false
+StarUpgradeChance = 100
+MaxOffspringStars = 2
+```
+
+With these settings, seals can progressively produce higher-star offspring until reaching 2 stars, without a separate high-star quota.
+
+#### Example: Selective breeding
+
+```ini
+[Seal]
+EnableStarUpgrades = true
+SelectiveStarBreeding = true
+StarUpgradeChance = 100
+MaxOffspringStars = 2
+MaxTwoStarSeals = 2
+StarCheckRadius = 15
+AtCapacityOneStarChance = 100
+```
+
+With these settings:
+
+- Offspring can upgrade by one star per generation until reaching 2 stars.
+- Up to two nearby 2-star seals are permitted before the high-star birth restriction activates.
+- Once two 2-star seals are within 15 metres, subsequent offspring are born at 1 star.
+- Removing a 2-star seal allows higher-star offspring to be produced again when the local high-star count falls below the limit.
+
+These examples use accelerated upgrade chances for demonstration. The default configuration keeps star upgrades disabled.
+
 ## Admin commands
 
 When used with ServerDevcommands:
@@ -143,13 +235,15 @@ When used with ServerDevcommands:
 
 Displays information about nearby supported creatures, including taming progress, hunger, breeding progress, pregnancy, and available feeding containers.
 
+ServerDevcommands is optional and is not required for normal taming, breeding, or feeding functionality.
+
 ## Known limitations
 
 - The mod does not add the vanilla `Tameable` component to creatures on player clients.
 - Vanilla petting, renaming, and Follow/Stay interactions are not provided.
 - Creatures do not automatically walk toward dropped food.
 - Taming and breeding are processed in areas around connected players.
-- Tamed seals can still be damaged by player attacks because the vanilla seal prefab is marked as aggravatable. Player-friendly-fire protection for seals is not currently implemented.
+- Tamed adult seals can still be damaged by player attacks because the vanilla adult seal prefab is marked as aggravatable. Player-friendly-fire protection for adult seals is not currently implemented.
 
 ## Credits
 
