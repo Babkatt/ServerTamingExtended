@@ -49,6 +49,17 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 
     private ConfigEntry<float> _sealPupGrowMinutes;
 
+    private ConfigEntry<bool> _enableSealStarUpgrades;
+    private ConfigEntry<bool> _selectiveSealStarBreeding;
+    private ConfigEntry<float> _sealStarUpgradeChance;
+    private ConfigEntry<int> _sealMaxOffspringStars;
+    private ConfigEntry<int> _sealMaxTwoStarSeals;
+    private ConfigEntry<float> _sealStarCheckRadius;
+    private ConfigEntry<float> _sealAtCapacityOneStarChance;
+
+    // Prevent multiple births in one update from exceeding the 2-star quota.
+    private readonly List<Vector3> _highStarSealBirthsThisTick = new List<Vector3>();
+
     private static readonly int KeyPupBorn = "ServerTamingExtended_pupBorn".GetStableHashCode();
 
     private ConfigEntry<float> _tickSeconds;
@@ -261,6 +272,43 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 			60f,
 			"Game-world minutes before a seal pup born by this mod matures into an adult."
 		);
+        _enableSealStarUpgrades = Config.Bind(
+			"Seal", "EnableStarUpgrades", false,
+			"Enable optional seal offspring star upgrades. False preserves original parent-star inheritance.");
+
+        _selectiveSealStarBreeding = Config.Bind(
+            "Seal", "SelectiveStarBreeding", false,
+            "False = normal chance for +1 star, without star-specific population caps. True = limit 2-star births and produce mostly 0-star pups when the quota is full. Only applies when EnableStarUpgrades is true.");
+
+        _sealStarUpgradeChance = Config.Bind(
+            "Seal", "StarUpgradeChance", 5f,
+            new ConfigDescription(
+                "Percentage chance (0-100) for a pup to inherit one additional star above its parent. Only applies when EnableStarUpgrades is true.",
+                new AcceptableValueRange<float>(0f, 100f)));
+
+        _sealMaxOffspringStars = Config.Bind(
+            "Seal", "MaxOffspringStars", 2,
+            new ConfigDescription(
+                "Maximum offspring star level when star upgrades are enabled. Does not affect existing seals. Only applies when EnableStarUpgrades is true.",
+                new AcceptableValueRange<int>(0, 10)));
+
+        _sealMaxTwoStarSeals = Config.Bind(
+            "Seal", "MaxTwoStarSeals", 2,
+            new ConfigDescription(
+                "Maximum number of 2-star-or-higher seals and pups permitted nearby for new high-star births. Only applies when EnableStarUpgrades and SelectiveStarBreeding are true.",
+                new AcceptableValueRange<int>(0, 100)));
+
+        _sealStarCheckRadius = Config.Bind(
+            "Seal", "StarCheckRadius", 15f,
+            new ConfigDescription(
+                "Radius in metres used to count existing 2-star-or-higher seals and pups. Only applies when EnableStarUpgrades and SelectiveStarBreeding are true.",
+                new AcceptableValueRange<float>(1f, 100f)));
+
+        _sealAtCapacityOneStarChance = Config.Bind(
+            "Seal", "AtCapacityOneStarChance", 5f,
+            new ConfigDescription(
+                "Percentage chance (0-100) of a 1-star pup when the local 2-star quota is full; otherwise produces a 0-star pup. Only applies when EnableStarUpgrades and SelectiveStarBreeding are true.",
+                new AcceptableValueRange<float>(0f, 100f)));
         new Terminal.ConsoleCommand("tamestatus", "[radius] - show server taming/breeding progress of animals near you; use through 'server tamestatus'", Status);
 		Harmony harmony = new Harmony(Guid);
 		harmony.PatchAll(typeof(SavePatch));
@@ -379,7 +427,8 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		Collect();
 		UpdateChestRanges();
 		_eaten.Clear();
-		foreach (ZDO zdo in _animals)
+        _highStarSealBirthsThisTick.Clear();
+        foreach (ZDO zdo in _animals)
 		{
 			Species s = _speciesByPrefab[zdo.GetPrefab()];
 			State st = GetState(zdo);
@@ -1175,6 +1224,84 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
         }
     }
 
+
+    private int SelectSealOffspringLevel(ZDO parent, Vector3 birthPosition)
+    {
+        int parentStars = Mathf.Max(0, parent.GetInt(ZDOVars.s_level, 1) - 1);
+
+        // Original ServerTaming behavior: no change whatsoever.
+        if (!_enableSealStarUpgrades.Value)
+            return parentStars + 1;
+
+        int maxStars = Mathf.Max(0, _sealMaxOffspringStars.Value);
+        int stars = Mathf.Min(parentStars, maxStars);
+
+        if (_selectiveSealStarBreeding.Value)
+        {
+            int highStarCount = CountNearbyHighStarSeals(birthPosition);
+
+            if (highStarCount >= _sealMaxTwoStarSeals.Value)
+            {
+                // Quota reached: mostly 0-star, occasionally 1-star.
+                float chance = Mathf.Clamp(
+                    _sealAtCapacityOneStarChance.Value, 0f, 100f);
+
+                int fallbackStars = UnityEngine.Random.value < chance / 100f ? 1 : 0;
+                return Mathf.Min(fallbackStars, maxStars) + 1;
+            }
+        }
+
+        // Normal inheritance, with one possible star upgrade.
+        if (stars < maxStars &&
+            UnityEngine.Random.value < Mathf.Clamp(
+                _sealStarUpgradeChance.Value, 0f, 100f) / 100f)
+        {
+            stars++;
+        }
+
+        return stars + 1; // Convert stars to Valheim's internal level.
+    }
+
+    private int CountNearbyHighStarSeals(Vector3 position)
+    {
+        float radius = Mathf.Max(0f, _sealStarCheckRadius.Value);
+        float radiusSq = radius * radius;
+        int count = 0;
+        int sealHash = "Seal".GetStableHashCode();
+
+        // Existing adult seals.
+        foreach (ZDO animal in _animals)
+        {
+            if (animal.GetPrefab() == sealHash &&
+                animal.GetInt(ZDOVars.s_level, 1) >= 3 &&
+                (animal.GetPosition() - position).sqrMagnitude <= radiusSq)
+            {
+                count++;
+            }
+        }
+
+        // Existing seal pups.
+        foreach (ZDO pup in _pups)
+        {
+            if (pup.GetInt(ZDOVars.s_level, 1) >= 3 &&
+                (pup.GetPosition() - position).sqrMagnitude <= radiusSq)
+            {
+                count++;
+            }
+        }
+
+        // High-star pups born earlier in this same update.
+        foreach (Vector3 birth in _highStarSealBirthsThisTick)
+        {
+            if ((birth - position).sqrMagnitude <= radiusSq)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
     // Creates the offspring directly as a ZDO (like ZNetView.Awake does) so the server does not need
     // the area loaded; the nearest client takes ownership and instantiates a vanilla tamed adult.
     // The server has no colliders loaded, so it can't see fences. Both parents are inside the pen, so
@@ -1204,19 +1331,29 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
         zdo.SetPrefab(offspringHash);
         zdo.SetRotation(Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f));
 		zdo.Set(ZDOVars.s_tamed, value: true);
-		int level = parent.GetInt(ZDOVars.s_level, 1);
-		if (level > 1)
-		{
-			zdo.Set(ZDOVars.s_level, level);
-		}
+        int level = isSeal
+			? SelectSealOffspringLevel(parent, pos)
+			: parent.GetInt(ZDOVars.s_level, 1);
+
+        if (level > 1)
+        {
+            zdo.Set(ZDOVars.s_level, level);
+        }
         if (isSeal)
         {
             zdo.Set(KeyPupBorn, (long)(ZNet.instance.GetTimeSeconds() * 1000.0));
+
+            if (_enableSealStarUpgrades.Value &&
+                _selectiveSealStarBreeding.Value &&
+                level >= 3)
+            {
+                _highStarSealBirthsThisTick.Add(pos);
+            }
         }
         zdo.SetOwner(0L);
 		Message(pos, MessageHud.MessageType.Center, "A new " + s.Name + " was born");
-		Logger.LogInfo($"{s.Prefab} born at {Format(pos)}.");
-	}
+        Logger.LogInfo($"{s.Prefab} born at {Format(pos)} ({level - 1} star(s)).");
+    }
 
 	// TameAssist's MessageTypes: None, TopLeftNear, TopLeftFar, CenterNear, CenterFar, InWorld.
 	private void TameAssistMessage(Vector3 pos, string text)
