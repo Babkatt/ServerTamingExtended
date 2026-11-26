@@ -29,7 +29,7 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 {
 	public const string Guid = "Christian.ServerTamingExtended";
 
-	public const string Version = "1.1.0";
+	public const string Version = "1.2.1";
 
 	private static readonly int KeyTameLeft = "ServerTamingExtended_tameLeft".GetStableHashCode();
 
@@ -105,8 +105,12 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 	private ConfigEntry<int> _maxTamedNearby;
 
 	private ConfigEntry<bool> _debugLog;
+    private ConfigEntry<float> _debugLogRadius;
 
-	private readonly List<Species> _species = new List<Species>();
+    private ConfigEntry<bool> _logHungryChecks;
+
+    private readonly List<Vector3> _debugCenters = new List<Vector3>();
+    private readonly List<Species> _species = new List<Species>();
 
 	private readonly Dictionary<int, Species> _speciesByPrefab = new Dictionary<int, Species>();
 
@@ -234,9 +238,13 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		public double NextBreedCheck;
 
 		public bool TameAnnounced;
-	}
 
-	private void Awake()
+        // Diagnostic tracking only; not persisted to world saves.
+        public string LastDiagnosticStatus;
+        public bool? LastDiagnosticTamed;
+    }
+
+    private void Awake()
 	{
 		_instance = this;
 
@@ -245,8 +253,10 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		_requireCalm = Config.Bind("General", "RequireCalm", true, "Taming and breeding pause while the animal is alerted (fleeing or fighting), like vanilla.");
 		_messageRange = Config.Bind("General", "MessageRange", 30f, "Players within this many metres see taming and birth messages.");
 		_progressMessages = Config.Bind("General", "ProgressMessages", true, "Show taming progress to nearby players: at 25/50/75%, or with TameAssist's TamingProgressMessageType when TameAssist is used.");
-		_debugLog = Config.Bind("General", "DebugLog", false, "Log feeding, love and breeding decisions for every animal near players (verbose; for troubleshooting).");
-		_maxTameStars = Config.Bind("General", "MaxTameStars", -1, "Highest star count that can be tamed; -1 means any (including the 3+ star creatures from level mods such as ServersideQoL CreatureLevelUp). Offspring keep their parent's stars.");
+        _debugLog = Config.Bind("General", "DebugLog", false, "Enable detailed diagnostics for feeding, stack consumption, " + "satiety, taming, animal status, affection, breeding decisions, " + "pregnancy, offspring births, and maturation. " + "Verbose; intended for troubleshooting.");
+        _debugLogRadius = Config.Bind("General", "DebugLogRadius", 15f, "Only record detailed animal diagnostics within " + "this many metres of a connected player. " + "0 = unrestricted. Does not affect simulation.");
+        _logHungryChecks = Config.Bind("General", "LogHungryChecks", false, "Log every unsuccessful food search. " + "False retains hunger status changes without " + "repeating unsuccessful searches every tick.");
+        _maxTameStars = Config.Bind("General", "MaxTameStars", -1, "Highest star count that can be tamed; -1 means any (including the 3+ star creatures from level mods such as ServersideQoL CreatureLevelUp). Offspring keep their parent's stars.");
 		_useTameAssist = Config.Bind("Containers", "UseTameAssistSettings", true, "When ServersideQoL TameAssist is installed, use its FeedFromContainers settings (range, chest sign range, LeaveAtLeast), its TamingTimeMultiplier and FedDurationMultiplier, and its TamingProgressMessageType. The two settings below are then ignored.");
 		_containerRange = Config.Bind("Containers", "FeedFromContainersRange", 0f, "Without TameAssist: animals eat from chests within this many metres (0 = off).");
 		_leaveAtLeast = Config.Bind("Containers", "LeaveAtLeast", 1, "Without TameAssist: keep at least this many of each food in a chest.");
@@ -313,7 +323,8 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		Harmony harmony = new Harmony(Guid);
 		harmony.PatchAll(typeof(SavePatch));
 		harmony.PatchAll(typeof(DestroyPatch));
-	}
+        harmony.PatchAll(typeof(RemoteCommandPatch));
+    }
 
 	private void AddSpecies(string prefab, string foods, float taming, float fed, float pregnancy)
 	{
@@ -354,7 +365,7 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 			}
 			s.Hash = s.Prefab.GetStableHashCode();
 			s.Name = go.GetComponent<Character>().m_name;
-            if (s.Prefab == "Deer" || s.Prefab == "Seal")
+            if (_debugLog.Value)
             {
                 Character character = go.GetComponent<Character>();
                 BaseAI ai = go.GetComponent<BaseAI>();
@@ -427,31 +438,105 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		Collect();
 		UpdateChestRanges();
 		_eaten.Clear();
+
         _highStarSealBirthsThisTick.Clear();
+
         foreach (ZDO zdo in _animals)
-		{
-			Species s = _speciesByPrefab[zdo.GetPrefab()];
-			State st = GetState(zdo);
-			bool tamed = zdo.GetBool(ZDOVars.s_tamed);
-			if (!tamed && !CanTame(zdo))
-			{
-				continue;
-			}
-			bool calm = !_requireCalm.Value || !zdo.GetBool(ZDOVars.s_alert);
-			if (now >= st.FedUntil)
-			{
-				TryEat(zdo, s, st, now, tamed);
-			}
-			bool fed = now < st.FedUntil;
-			if (!tamed)
-			{
-				UpdateTaming(zdo, s, st, fed, calm, dt);
-			}
-			else if (s.Breeding.Value)
-			{
-				UpdateBreeding(zdo, s, st, fed && calm, now);
-			}
-		}
+        {
+            Species s = _speciesByPrefab[zdo.GetPrefab()];
+            State st = GetState(zdo);
+            bool tamed = zdo.GetBool(ZDOVars.s_tamed);
+
+            if (!tamed && !CanTame(zdo))
+            {
+                if (ShouldDebug(zdo))
+                {
+                    string blocked = "Taming blocked: star level exceeds MaxTameStars.";
+
+                    if (st.LastDiagnosticStatus != blocked)
+                    {
+                        Debug($"[STATUS] {Describe(zdo)}: {blocked}");
+                        st.LastDiagnosticStatus = blocked;
+                    }
+                }
+
+                continue;
+            }
+
+            bool calm = !_requireCalm.Value || !zdo.GetBool(ZDOVars.s_alert);
+
+            if (now >= st.FedUntil)
+            {
+                TryEat(zdo, s, st, now, tamed);
+            }
+
+            bool fed = now < st.FedUntil;
+
+            if (ShouldDebug(zdo))
+            {
+                // Confirm changes to the actual vanilla tamed flag.
+                if (st.LastDiagnosticTamed.HasValue &&
+                    st.LastDiagnosticTamed.Value != tamed)
+                {
+                    Debug($"[TAMING] {Describe(zdo)}: " +
+                        $"TamedFlag changed from " +
+                        $"{st.LastDiagnosticTamed.Value} to {tamed}.");
+                }
+
+                st.LastDiagnosticTamed = tamed;
+
+                string status;
+
+                if (!tamed)
+                {
+                    status = fed && calm
+                        ? "Taming active"
+                        : $"Taming paused: {(!fed ? "hungry" : "fed")}, " +
+                          $"{(!calm ? "alerted" : "calm")}";
+                }
+                else if (!s.Breeding.Value)
+                {
+                    status = "Breeding disabled";
+                }
+                else if (st.Pregnant > 0.0)
+                {
+                    status = "Pregnant";
+                }
+                else if (!fed || !calm)
+                {
+                    status = $"Breeding paused: {(!fed ? "hungry" : "fed")}, " +
+                        $"{(!calm ? "alerted" : "calm")}";
+                }
+                else
+                {
+                    status = "Ready for breeding checks";
+                }
+
+                if (st.LastDiagnosticStatus != status)
+                {
+                    Debug($"[STATUS] {Describe(zdo)}: {status}. " +
+                        $"Fed={fed}, Calm={calm}, " +
+                        $"Love={st.Love}/{Mathf.Max(1, _requiredLovePoints.Value)}.");
+
+                    st.LastDiagnosticStatus = status;
+                }
+            }
+            else
+            {
+                st.LastDiagnosticStatus = null;
+                st.LastDiagnosticTamed = null;
+            }
+
+            if (!tamed)
+            {
+                UpdateTaming(zdo, s, st, fed, calm, dt);
+            }
+            else if (s.Breeding.Value)
+            {
+                UpdateBreeding(zdo, s, st, fed && calm, now);
+            }
+        }
+
         GrowSealPups(now);
         if (++_ticks % 60 == 0)
 		{
@@ -478,7 +563,11 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		{
 			centers.Add(ZNet.instance.GetReferencePosition());
 		}
-		foreach (Vector3 center in centers)
+        _debugCenters.Clear();
+
+        if (_debugLog.Value)
+            _debugCenters.AddRange(centers);
+        foreach (Vector3 center in centers)
 		{
 			_sectorObjects.Clear();
 			ZDOMan.instance.FindSectorObjects(ZoneSystem.GetZone(center), near, _sectorObjects);
@@ -530,8 +619,21 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 				Pregnant = zdo.GetLong(KeyPregnant, 0L) / 1000.0
 			};
 			_states[zdo.m_uid] = st;
-		}
-		return st;
+
+            if (ShouldDebug(zdo))
+            {
+                double now = ZNet.instance.GetTimeSeconds();
+
+                Debug($"[STATE] {Describe(zdo)}: " +
+                    $"loaded animal state. " +
+                    $"TameLeft={st.TameLeft:0.00}s, " +
+                    $"FedRemaining={Math.Max(0.0, st.FedUntil - now):0.00}s, " +
+                    $"Love={st.Love}/{Mathf.Max(1, _requiredLovePoints.Value)}, " +
+                    $"Pregnant={st.Pregnant > 0.0}, " +
+                    $"PregnancyElapsed={(st.Pregnant > 0.0 ? now - st.Pregnant : 0.0):0.00}s.");
+            }
+        }
+        return st;
 	}
 
 	// Other server mods replace a creature's ZDO with a copy under a new ZDOID: ServersideQoL
@@ -573,8 +675,11 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		}
 		_orphans.Remove(best);
 		_states[zdo.m_uid] = best.State;
-		Debug($"{zdo.m_uid}: took over the state of replaced {best.From} (level {level}).");
-		return best.State;
+        if (ShouldDebug(zdo))
+        {
+            Debug($"{zdo.m_uid}: took over the state of replaced {best.From} (level {level}).");
+        }
+        return best.State;
 	}
 
 	private string Describe(ZDO zdo)
@@ -583,15 +688,43 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		return $"{_speciesByPrefab[zdo.GetPrefab()].Prefab} {zdo.m_uid} ({zdo.GetInt(ZDOVars.s_level, 1) - 1} star(s), {(zdo.GetBool(ZDOVars.s_tamed) ? "tamed" : "wild")}, owner {zdo.GetOwner()}) at ({p.x:0}, {p.y:0}, {p.z:0})";
 	}
 
-	private void Debug(string text)
-	{
-		if (_debugLog.Value)
-		{
-			Logger.LogInfo(text);
-		}
-	}
+    private bool ShouldDebug(Vector3 position)
+    {
+        if (!_debugLog.Value)
+            return false;
 
-	[HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.DestroyZDO))]
+        float radius = _debugLogRadius.Value;
+
+        if (radius <= 0f)
+            return true;
+
+        if (ZNet.instance == null)
+            return false;
+
+        float radiusSq = radius * radius;
+
+        foreach (Vector3 center in _debugCenters)
+        {
+            if ((center - position).sqrMagnitude <= radiusSq)
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool ShouldDebug(ZDO zdo)
+    {
+        return zdo != null &&
+            ShouldDebug(zdo.GetPosition());
+    }
+
+    private void Debug(string text)
+    {
+        if (_debugLog.Value)
+            Logger.LogInfo(text);
+    }
+
+    [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.DestroyZDO))]
 	private static class DestroyPatch
 	{
 		private static void Prefix(ZDO zdo)
@@ -802,27 +935,41 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		return Mathf.Max(1f, s.TamingMinutes.Value * 60f * _feeding.TamingMultiplier);
 	}
 
-	private void TryEat(ZDO animal, Species s, State st, double now, bool tamed)
-	{
+    private void TryEat(ZDO animal, Species s, State st, double now, bool tamed)
+    {
         bool allowChest = tamed ||
-			(!_feeding.MarkedChests && _feedWildFromContainers.Value);
+            (!_feeding.MarkedChests && _feedWildFromContainers.Value);
 
         string source = TryEatFromGround(animal, s)
             ? "the ground"
             : allowChest && TryEatFromChest(animal, s)
                 ? "a chest"
                 : null;
-        if (source != null)
-		{
-			st.FedUntil = now + s.FedMinutes.Value * 60.0 * _feeding.FedMultiplier;
-		}
-		if (_debugLog.Value)
-		{
-			Debug($"{Describe(animal)} is hungry: " + (source != null ? "ate from " + source + "." : $"no food found ({_chests.Count(c => _chestRanges.ContainsKey(c.m_uid))} feeding chest(s) loaded)."));
-		}
-	}
 
-	private bool TryEatFromChest(ZDO animal, Species s)
+        if (source != null)
+        {
+            st.FedUntil = now + s.FedMinutes.Value * 60.0 * _feeding.FedMultiplier;
+
+            if (ShouldDebug(animal))
+            {
+                Debug($"[SATIETY] {Describe(animal)}: " +
+                    $"ate from {source}. " +
+                    $"BaseFedMinutes={s.FedMinutes.Value:0.00}, " +
+                    $"FedMultiplier={_feeding.FedMultiplier:0.00}, " +
+                    $"EffectiveFedMinutes={(st.FedUntil - now) / 60.0:0.00}, " +
+                    $"FedUntil={st.FedUntil:0.00}.");
+            }
+        }
+        else if (ShouldDebug(animal) && _logHungryChecks.Value)
+        {
+            Debug($"[FEEDING] {Describe(animal)}: " +
+                $"hungry; no eligible food found. " +
+                $"ChestFeedingAllowed={allowChest && _feeding.Containers}, " +
+                $"FeedingChests={_chests.Count(c => _chestRanges.ContainsKey(c.m_uid))}.");
+        }
+    }
+
+    private bool TryEatFromChest(ZDO animal, Species s)
 	{
 		if (!_feeding.Containers)
 		{
@@ -831,20 +978,30 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		Vector3 pos = animal.GetPosition();
 		foreach (ZDO chest in _chests.OrderBy(c => (c.GetPosition() - pos).sqrMagnitude))
 		{
-			if (_chestRanges.TryGetValue(chest.m_uid, out float range) && (chest.GetPosition() - pos).sqrMagnitude <= range * range && TakeOneFood(chest, s.FoodHashes, _feeding.LeaveAtLeast))
-			{
-				return true;
-			}
-		}
-		return false;
+            if (_chestRanges.TryGetValue(chest.m_uid, out float range) &&
+                (chest.GetPosition() - pos).sqrMagnitude <= range * range &&
+                TakeOneFood(chest, s.FoodHashes, _feeding.LeaveAtLeast))
+            {
+                if (ShouldDebug(animal))
+                {
+                    Debug($"[FEEDING] {Describe(animal)}: " +
+                        $"successfully ate from chest {chest.m_uid}. " +
+                        $"Distance={Vector3.Distance(chest.GetPosition(), pos):0.00}m, " +
+                        $"AllowedRange={range:0.00}m.");
+                }
+
+                return true;
+            }
+        }
+        return false;
 	}
 
-	// Takes one food item out of a chest by editing its saved inventory bytes in place: a stack is
-	// decremented or the item entry removed. Working on the bytes keeps every other item exactly as it
-	// was, even items the server's ObjectDB doesn't know.
-	private static bool TakeOneFood(ZDO chest, HashSet<int> foods, int leaveAtLeast)
-	{
-		if (chest.GetBool(ZDOVars.s_inUse))
+    // Takes one food item out of a chest by editing its saved inventory bytes in place: a stack is
+    // decremented or the item entry removed. Working on the bytes keeps every other item exactly as it
+    // was, even items the server's ObjectDB doesn't know.
+    private bool TakeOneFood(ZDO chest, HashSet<int> foods, int leaveAtLeast)
+    {
+        if (chest.GetBool(ZDOVars.s_inUse))
 		{
 			return false;
 		}
@@ -861,11 +1018,17 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		{
 			ZPackage pkg = new ZPackage(data);
 			int version = pkg.ReadInt();
-			if (version < (int)global::Version.Item.Smaller)
-			{
-				return false;
-			}
-			count = pkg.ReadUShort();
+            if (version < (int)global::Version.Item.Smaller)
+            {
+                if (ShouldDebug(chest))
+                {
+                    Debug($"[FEEDING] Chest {chest.m_uid}: " +
+                        $"unsupported inventory version {version}.");
+                }
+
+                return false;
+            }
+            count = pkg.ReadUShort();
 			for (int i = 0; i < count; i++)
 			{
 				int start = pkg.GetPos();
@@ -875,11 +1038,19 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 			}
 			bytes = pkg.GetArray();
 		}
-		catch (Exception)
-		{
-			return false;
-		}
-		foreach (int food in foods)
+
+        catch (Exception ex)
+        {
+            if (ShouldDebug(chest))
+            {
+                Debug($"[FEEDING] Chest {chest.m_uid}: " +
+                    $"failed to deserialize inventory. {ex}");
+            }
+
+            return false;
+        }
+
+        foreach (int food in foods)
 		{
 			List<(int Start, int End, int Hash, int Stack)> stacks = items.Where(x => x.Hash == food && x.Stack > 0).OrderBy(x => x.Stack).ToList();
 			if (stacks.Sum(x => x.Stack) - 1 < Math.Max(0, leaveAtLeast))
@@ -911,49 +1082,104 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 			{
 				chest.SetOwner(ZDOMan.GetSessionID());
 			}
-			chest.Set(ZDOVars.s_items, result);
-			return true;
-		}
-		return false;
+
+            chest.Set(ZDOVars.s_items, result);
+
+            if (ShouldDebug(chest))
+            {
+                GameObject foodPrefab = ZNetScene.instance.GetPrefab(food);
+                string foodName = foodPrefab != null
+                    ? foodPrefab.name
+                    : food.ToString();
+
+                byte[] verification = chest.GetByteArray(ZDOVars.s_items);
+                bool writeMatches = verification != null &&
+                    verification.SequenceEqual(result);
+
+                Debug($"[FEEDING] Chest {chest.m_uid}: " +
+                    $"consumed {foodName}. " +
+                    $"Stack={target.Stack} -> {target.Stack - 1}, " +
+                    $"InventoryWriteVerified={writeMatches}, " +
+                    $"Owner={chest.GetOwner()}, " +
+                    $"IsOwner={chest.IsOwner()}.");
+            }
+
+            return true;
+
+        }
+        return false;
 	}
 
-	private bool TryEatFromGround(ZDO animal, Species s)
-	{
-		Vector3 pos = animal.GetPosition();
-		float best = _feedRadius.Value * _feedRadius.Value;
-		ZDO food = null;
-		foreach (ZDO item in _foods)
-		{
-			if (!s.FoodHashes.Contains(item.GetPrefab()) || _eaten.Contains(item.m_uid))
-			{
-				continue;
-			}
-			Vector3 d = item.GetPosition() - pos;
-			if (Mathf.Abs(d.y) > 4f)
-			{
-				continue;
-			}
-			float d2 = d.x * d.x + d.z * d.z;
-			if (d2 <= best)
-			{
-				best = d2;
-				food = item;
-			}
-		}
-		if (food == null)
-		{
-			return false;
-		}
-		// Own the item before changing it so the client that simulated it cannot overwrite the change.
-		if (!food.IsOwner())
-		{
-			food.SetOwner(ZDOMan.GetSessionID());
-		}
+    private bool TryEatFromGround(ZDO animal, Species s)
+    {
+        Vector3 pos = animal.GetPosition();
+        float best = _feedRadius.Value * _feedRadius.Value;
+        ZDO food = null;
+
+        foreach (ZDO item in _foods)
+        {
+            if (!s.FoodHashes.Contains(item.GetPrefab()) || _eaten.Contains(item.m_uid))
+            {
+                continue;
+            }
+
+            Vector3 d = item.GetPosition() - pos;
+
+            if (Mathf.Abs(d.y) > 4f)
+            {
+                continue;
+            }
+
+            float d2 = d.x * d.x + d.z * d.z;
+
+            if (d2 <= best)
+            {
+                best = d2;
+                food = item;
+            }
+        }
+
+        if (food == null)
+        {
+            return false;
+        }
+
+        if (ShouldDebug(animal))
+        {
+            Debug($"[FEEDING] {Describe(animal)}: " +
+                $"ground food detected. " +
+                $"FoodZDO={food.m_uid}, " +
+                $"Distance={Mathf.Sqrt(best):0.00}m, " +
+                $"Owner={food.GetOwner()}, " +
+                $"ServerID={ZDOMan.GetSessionID()}.");
+        }
+
+        // Own the item before changing it so the client
+        // that simulated it cannot overwrite the change.
+        if (!food.IsOwner())
+        {
+            food.SetOwner(ZDOMan.GetSessionID());
+
+            if (ShouldDebug(animal))
+            {
+                Debug($"[FEEDING] Ground food {food.m_uid}: " +
+                    $"ownership requested. " +
+                    $"Owner={food.GetOwner()}, " +
+                    $"IsOwner={food.IsOwner()}.");
+            }
+        }
+
         GameObject prefab = ZNetScene.instance.GetPrefab(food.GetPrefab());
         ItemDrop drop = prefab != null ? prefab.GetComponent<ItemDrop>() : null;
 
         if (drop == null || drop.m_itemData == null)
         {
+            if (ShouldDebug(animal))
+            {
+                Debug($"[FEEDING] {Describe(animal)}: " +
+                    $"ground food {food.m_uid} has no valid ItemDrop data.");
+            }
+
             return false;
         }
 
@@ -962,6 +1188,15 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 
         // Read the actual dropped-item data using Valheim's serialization.
         ItemDrop.LoadFromZDO(foodData, food, -1);
+
+        if (ShouldDebug(animal))
+        {
+            Debug($"[FEEDING] {Describe(animal)}: " +
+                $"reading {prefab.name}, " +
+                $"FoodZDO={food.m_uid}, " +
+                $"Stack={foodData.m_stack}, " +
+                $"Owner={food.GetOwner()}.");
+        }
 
         if (foodData.m_stack <= 0)
         {
@@ -972,48 +1207,112 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
         // Consume exactly one item.
         if (foodData.m_stack > 1)
         {
+            int previousStack = foodData.m_stack;
+
             foodData.m_stack--;
             ItemDrop.SaveToZDO(foodData, food, -1);
+
+            if (ShouldDebug(animal))
+            {
+                // Reload the ZDO into a fresh ItemData object
+                // to verify the saved stack quantity.
+                ItemDrop.ItemData verificationData = drop.m_itemData.Clone();
+                verificationData.m_stack = 0;
+
+                ItemDrop.LoadFromZDO(verificationData, food, -1);
+
+                Debug($"[FEEDING] {Describe(animal)}: " +
+                    $"consumed {prefab.name} from ground stack. " +
+                    $"FoodZDO={food.m_uid}, " +
+                    $"Before={previousStack}, " +
+                    $"Expected={previousStack - 1}, " +
+                    $"Actual={verificationData.m_stack}, " +
+                    $"Owner={food.GetOwner()}, " +
+                    $"IsOwner={food.IsOwner()}.");
+
+                if (verificationData.m_stack != previousStack - 1)
+                {
+                    Debug($"[FEEDING] STACK MISMATCH: " +
+                        $"FoodZDO={food.m_uid}, " +
+                        $"expected {previousStack - 1}, " +
+                        $"read back {verificationData.m_stack}.");
+                }
+            }
         }
         else
         {
+            if (ShouldDebug(animal))
+            {
+                Debug($"[FEEDING] {Describe(animal)}: " +
+                    $"consumed last {prefab.name} from ground. " +
+                    $"FoodZDO={food.m_uid}, " +
+                    $"Stack=1 -> 0. Destroying food ZDO.");
+            }
+
             _eaten.Add(food.m_uid);
             ZDOMan.instance.DestroyZDO(food);
         }
+
         return true;
-	}
+    }
 
-	private void UpdateTaming(ZDO zdo, Species s, State st, bool fed, bool calm, float dt)
-	{
-		float total = TamingSeconds(s);
-		if (st.TameLeft < 0f || st.TameLeft > total)
-		{
-			st.TameLeft = total;
-		}
-		if (fed && calm && st.TameLeft > 0f)
-		{
-			int before = Step(st.TameLeft, total);
-			st.TameLeft = Mathf.Max(0f, st.TameLeft - dt);
-			int after = Step(st.TameLeft, total);
-			if (_progressMessages.Value && !_feeding.FromTameAssist && after > before && after < 4)
-			{
-				Message(zdo.GetPosition(), MessageHud.MessageType.TopLeft, $"{s.Name}: taming {after * 25}%");
-			}
-		}
-		// Like TameAssist: once taming has started, show progress with its message type on every update.
-		if (_progressMessages.Value && _feeding.FromTameAssist && st.TameLeft > 0f && st.TameLeft < total)
-		{
-			string text = string.Format(fed ? "$hud_tameness {0:P0}" : "$hud_tameness {0:P0}, $hud_tamehungry", 1f - st.TameLeft / total);
-			TameAssistMessage(zdo.GetPosition(), text);
-		}
-		if (st.TameLeft <= 0f)
-		{
-			Tame(zdo, s, st);
-		}
-	}
 
-	// Level 1 is no star, level 3 is two stars.
-	private bool CanTame(ZDO zdo)
+
+    private void UpdateTaming(ZDO zdo, Species s, State st, bool fed, bool calm, float dt)
+    {
+        float total = TamingSeconds(s);
+
+        if (st.TameLeft < 0f || st.TameLeft > total)
+        {
+            st.TameLeft = total;
+        }
+
+        if (fed && calm && st.TameLeft > 0f)
+        {
+            if (ShouldDebug(zdo) && st.TameLeft == total && dt > 0f)
+            {
+                Debug($"[TAMING] {Describe(zdo)}: " +
+                    $"taming started. " +
+                    $"Required time={total / 60f:0.00} min.");
+            }
+
+            int before = Step(st.TameLeft, total);
+            float previousLeft = st.TameLeft;
+
+            st.TameLeft = Mathf.Max(0f, st.TameLeft - dt);
+
+            int after = Step(st.TameLeft, total);
+
+            if (ShouldDebug(zdo) && st.TameLeft < previousLeft)
+            {
+                Debug($"[TAMING] {Describe(zdo)}: " +
+                    $"progress {(1f - previousLeft / total):P1} -> " +
+                    $"{(1f - st.TameLeft / total):P1}. " +
+                    $"Remaining={st.TameLeft:0.0}s.");
+            }
+
+            if (_progressMessages.Value && !_feeding.FromTameAssist && after > before && after < 4)
+            {
+                Message(zdo.GetPosition(), MessageHud.MessageType.TopLeft, $"{s.Name}: taming {after * 25}%");
+            }
+        }
+
+        // Like TameAssist: once taming has started, show progress with its message type on every update.
+        if (_progressMessages.Value && _feeding.FromTameAssist && st.TameLeft > 0f && st.TameLeft < total)
+        {
+            string text = string.Format(fed ? "$hud_tameness {0:P0}" : "$hud_tameness {0:P0}, $hud_tamehungry", 1f - st.TameLeft / total);
+            TameAssistMessage(zdo.GetPosition(), text);
+        }
+
+        if (st.TameLeft <= 0f)
+        {
+            Tame(zdo, s, st);
+        }
+    }
+
+
+    // Level 1 is no star, level 3 is two stars.
+    private bool CanTame(ZDO zdo)
 	{
 		return _maxTameStars.Value < 0 || zdo.GetInt(ZDOVars.s_level, 1) - 1 <= _maxTameStars.Value;
 	}
@@ -1040,55 +1339,128 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 			st.TameAnnounced = true;
 			Message(zdo.GetPosition(), MessageHud.MessageType.Center, s.Name + " $hud_tamedone");
 			Logger.LogInfo($"Tamed {s.Prefab} at {Format(zdo.GetPosition())}.");
-		}
-	}
 
-	private void UpdateBreeding(ZDO zdo, Species s, State st, bool ready, double now)
-	{
-		if (st.Pregnant > 0.0)
-		{
-			if (now - st.Pregnant >= s.PregnancyMinutes.Value * 60.0)
-			{
-				st.Pregnant = 0.0;
-				// Checked again: the herd may have grown (or wandered in) during the pregnancy.
-				string crowded = Crowded(zdo, s, atBirth: true);
-				if (crowded != null)
-				{
-					Logger.LogInfo($"{s.Prefab} birth at {Format(zdo.GetPosition())} skipped: {crowded}.");
-					return;
-				}
-				Birth(zdo, s);
-			}
-			return;
-		}
-		if (!ready || now < st.NextBreedCheck)
-		{
-			return;
-		}
-		float interval = Mathf.Max(1f, _breedCheckSeconds.Value);
-		st.NextBreedCheck = now + interval * UnityEngine.Random.Range(1f, 1.5f);
-		if (UnityEngine.Random.value > _loveChance.Value)
-		{
-			return;
-		}
-		string full = Crowded(zdo, s, atBirth: false);
-		if (full != null)
-		{
-			Debug($"{Describe(zdo)}: no love point ({full}).");
-			return;
-		}
-		Debug($"{Describe(zdo)}: love {st.Love + 1}/{Mathf.Max(1, _requiredLovePoints.Value)}.");
-		if (++st.Love >= Mathf.Max(1, _requiredLovePoints.Value))
-		{
-			st.Love = 0;
-			st.Pregnant = now;
-		}
-	}
+            if (ShouldDebug(zdo))
+            {
+                Debug($"[TAMING] {Describe(zdo)}: " +
+                    $"taming countdown completed. " +
+                    $"Method={(owner == 0L || owner == ZDOMan.GetSessionID() ? "direct ZDO update" : "RPC_SetTamed")}, " +
+                    $"TamedFlag={zdo.GetBool(ZDOVars.s_tamed)}.");
+            }
 
-	// Why this animal can't breed now, or null. Before a love point, pregnant animals nearby count once
-	// more each for the birth they will give, so many pregnancies at once can't overshoot MaxCreatures.
-	// At birth only the animals themselves count, and no partner is needed.
-	private string Crowded(ZDO zdo, Species s, bool atBirth)
+        }
+    }
+
+
+    private void UpdateBreeding(ZDO zdo, Species s, State st, bool ready, double now)
+    {
+        if (st.Pregnant > 0.0)
+        {
+            if (now - st.Pregnant >= s.PregnancyMinutes.Value * 60.0)
+            {
+                st.Pregnant = 0.0;
+
+                // Checked again: the herd may have grown
+                // (or wandered in) during the pregnancy.
+                string crowded = Crowded(zdo, s, atBirth: true);
+                if (crowded != null)
+                {
+                    Logger.LogInfo($"{s.Prefab} birth at {Format(zdo.GetPosition())} skipped: {crowded}.");
+
+                    if (ShouldDebug(zdo))
+                    {
+                        Debug($"[BREEDING] {Describe(zdo)}: " +
+                            $"pregnancy completed, but birth blocked: {crowded}.");
+                    }
+
+                    return;
+                }
+
+                if (ShouldDebug(zdo))
+                {
+                    Debug($"[PREGNANCY] {Describe(zdo)}: " +
+                        "pregnancy completed; attempting birth.");
+                }
+
+                Birth(zdo, s);
+            }
+            return;
+        }
+
+        if (!ready || now < st.NextBreedCheck)
+        {
+            return;
+        }
+
+        float interval = Mathf.Max(1f, _breedCheckSeconds.Value);
+        st.NextBreedCheck = now + interval * UnityEngine.Random.Range(1f, 1.5f);
+
+        if (ShouldDebug(zdo))
+        {
+            Debug($"[BREEDING] {Describe(zdo)}: " +
+                $"attempting affection gain. " +
+                $"Current love={st.Love}/{Mathf.Max(1, _requiredLovePoints.Value)}, " +
+                $"Fed for another {(st.FedUntil - now) / 60.0:0.00} min.");
+        }
+
+        float roll = UnityEngine.Random.value;
+
+        if (roll > _loveChance.Value)
+        {
+            if (ShouldDebug(zdo))
+            {
+                Debug($"[BREEDING] {Describe(zdo)}: " +
+                    $"affection roll failed ({roll:P1}; " +
+                    $"required <= {_loveChance.Value:P1}).");
+            }
+
+            return;
+        }
+
+        string full = Crowded(zdo, s, atBirth: false);
+        if (full != null)
+        {
+            if (ShouldDebug(zdo))
+            {
+                Debug($"[BREEDING] {Describe(zdo)}: " +
+                    $"affection blocked: {full}.");
+            }
+
+            return;
+        }
+
+        if (++st.Love >= Mathf.Max(1, _requiredLovePoints.Value))
+        {
+            if (ShouldDebug(zdo))
+            {
+                Debug($"[AFFECTION] {Describe(zdo)}: " +
+                    $"gained affection point " +
+                    $"{st.Love}/{Mathf.Max(1, _requiredLovePoints.Value)}.");
+            }
+
+            st.Love = 0;
+            st.Pregnant = now;
+
+            if (ShouldDebug(zdo))
+            {
+                Debug($"[PREGNANCY] {Describe(zdo)}: " +
+                    $"became pregnant. " +
+                    $"Expected gestation: {s.PregnancyMinutes.Value:0.00} min.");
+            }
+        }
+        else if (ShouldDebug(zdo))
+        {
+            Debug($"[AFFECTION] {Describe(zdo)}: " +
+                $"gained affection point " +
+                $"{st.Love}/{Mathf.Max(1, _requiredLovePoints.Value)}.");
+        }
+    }
+
+
+    // Why this animal can't breed now, or null. Before a love point, pregnant animals nearby count once
+    // more each for the birth they will give, so many pregnancies at once can't overshoot MaxCreatures.
+    // At birth only the animals themselves count, and no partner is needed.
+    private string Crowded(ZDO zdo, Species s, bool atBirth)
 	{
 		Vector3 pos = zdo.GetPosition();
 		float population2 = _populationRange.Value * _populationRange.Value;
@@ -1221,6 +1593,18 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
             ZDOMan.instance.DestroyZDO(pup);
 
             Logger.LogInfo($"Seal pup matured into an adult at {Format(pos)}.");
+
+            if (ShouldDebug(pos))
+            {
+                Debug($"[MATURATION] Seal pup matured into adult " +
+                    $"{adult.m_uid} ({level - 1} star(s)) " +
+                    $"at {Format(pos)}. " +
+                    $"Age={ageSeconds / 60.0:0.00} min, " +
+                    $"Required={growSeconds / 60.0:0.00} min, " +
+                    $"Tamed={adult.GetBool(ZDOVars.s_tamed)}, " +
+                    $"Owner={adult.GetOwner()}.");
+            }
+
         }
     }
 
@@ -1353,10 +1737,21 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
         zdo.SetOwner(0L);
 		Message(pos, MessageHud.MessageType.Center, "A new " + s.Name + " was born");
         Logger.LogInfo($"{s.Prefab} born at {Format(pos)} ({level - 1} star(s)).");
+
+        if (ShouldDebug(parent))
+        {
+            Debug($"[BIRTH] {Describe(parent)} gave birth to " +
+                $"{(isSeal ? "Seal_Pup" : s.Prefab)} {zdo.m_uid} " +
+                $"({level - 1} star(s)) at {Format(pos)}. " +
+                $"Tamed={zdo.GetBool(ZDOVars.s_tamed)}, " +
+                $"Owner={zdo.GetOwner()}, " +
+                $"Partner={(partner != null ? partner.m_uid.ToString() : "none")}.");
+        }
+
     }
 
-	// TameAssist's MessageTypes: None, TopLeftNear, TopLeftFar, CenterNear, CenterFar, InWorld.
-	private void TameAssistMessage(Vector3 pos, string text)
+    // TameAssist's MessageTypes: None, TopLeftNear, TopLeftFar, CenterNear, CenterFar, InWorld.
+    private void TameAssistMessage(Vector3 pos, string text)
 	{
 		string type = _feeding.ProgressMessageType;
 		if (type == "InWorld")
@@ -1430,75 +1825,276 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		}
 	}
 
-	private void Status(Terminal.ConsoleEventArgs args)
-	{
-		Terminal output = args.Context;
-		if (ZNet.instance == null || !ZNet.instance.IsServer())
-		{
-			Print(output, "tamestatus must run on the server: type 'server tamestatus' instead.");
-			return;
-		}
-		float radius = 30f;
-		if (args.Args.Length > 1 && float.TryParse(args.Args[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float r) && r > 0f)
-		{
-			radius = r;
-		}
-		Vector3? center = CallerPosition();
-		if (!center.HasValue)
-		{
-			Print(output, "Could not find your position.");
-			return;
-		}
-		if (!_resolved)
-		{
-			Resolve();
-		}
-		_feeding = ReadFeeding();
-		Collect();
-		UpdateChestRanges();
-		double now = ZNet.instance.GetTimeSeconds();
-		List<ZDO> near = _animals.Where(z => (z.GetPosition() - center.Value).sqrMagnitude <= radius * radius)
-			.OrderBy(z => (z.GetPosition() - center.Value).sqrMagnitude).ToList();
-		Print(output, $"{near.Count} tameable animal(s) within {radius:0} m.");
-		foreach (ZDO zdo in near.Take(20))
-		{
-			Species s = _speciesByPrefab[zdo.GetPrefab()];
-			State st = GetState(zdo);
-			float dist = Vector3.Distance(zdo.GetPosition(), center.Value);
-			string fed = now < st.FedUntil ? $"fed {(st.FedUntil - now) / 60.0:0.0} min" : "hungry";
-			string text;
-			int stars = zdo.GetInt(ZDOVars.s_level, 1) - 1;
-			if (!zdo.GetBool(ZDOVars.s_tamed) && !CanTame(zdo))
-			{
-				text = $"wild, {stars} star(s): above MaxTameStars, cannot be tamed";
-			}
-			else if (!zdo.GetBool(ZDOVars.s_tamed))
-			{
-				float total = TamingSeconds(s);
-				float left = st.TameLeft < 0f ? total : st.TameLeft;
-				text = $"wild, taming {(1f - left / total) * 100f:0}% ({left / 60f:0.0} min left), {fed}";
-			}
-			else if (st.Pregnant > 0.0)
-			{
-				text = $"tamed, pregnant ({(s.PregnancyMinutes.Value * 60.0 - (now - st.Pregnant)) / 60.0:0.0} min left), {fed}";
-			}
-			else
-			{
-				text = $"tamed, love {st.Love}/{_requiredLovePoints.Value}, {fed}";
-			}
-			Print(output, $"{s.Prefab} {new string('*', Math.Max(0, stars))} {dist:0} m: {text}");
-		}
-		Print(output, $"Chest feeding: {(_feeding.Containers ? "on" : "off")}{(_feeding.FromTameAssist ? " (TameAssist settings)" : "")}, global range {_feeding.Range:0} m, leave at least {_feeding.LeaveAtLeast}, wild animals {(!_feeding.MarkedChests && _feedWildFromContainers.Value ? "yes" : "no")}.");
-		HashSet<int> allFoods = new HashSet<int>(_species.SelectMany(x => x.FoodHashes));
-		foreach (ZDO chest in _chests.Where(c => (c.GetPosition() - center.Value).sqrMagnitude <= (radius + 64f) * (radius + 64f))
-			.OrderBy(c => (c.GetPosition() - center.Value).sqrMagnitude).Take(10))
-		{
-			string range = _chestRanges.TryGetValue(chest.m_uid, out float chestRange) ? $"range {chestRange:0} m" : "no range (no sign number, global range 0)";
-			Print(output, $"Chest {Vector3.Distance(chest.GetPosition(), center.Value):0} m: {range}, {(chest.GetBool(ZDOVars.s_inUse) ? "OPEN (skipped), " : "")}food: {DescribeFood(chest, allFoods)}");
-		}
-	}
+    private void Status(Terminal.ConsoleEventArgs args)
+    {
+        Terminal output = args.Context;
 
-	private static string DescribeFood(ZDO chest, HashSet<int> foods)
+        if (ZNet.instance == null ||
+            !ZNet.instance.IsServer())
+        {
+            Print(output,
+                "Use 'server tamestatus [radius]' on a server.");
+            return;
+        }
+
+        float radius = 30f;
+
+        if (args.Args.Length > 1 &&
+            float.TryParse(args.Args[1],
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out float r) &&
+            !float.IsNaN(r) &&
+            !float.IsInfinity(r) &&
+            r > 0f)
+        {
+            radius = Mathf.Clamp(r, 1f, 100f);
+        }
+
+        Vector3? center = CallerPosition();
+
+        if (!center.HasValue)
+        {
+            Print(output, "Could not find your position.");
+            return;
+        }
+
+        if (!_resolved)
+            Resolve();
+
+        _feeding = ReadFeeding();
+        Collect();
+        UpdateChestRanges();
+
+        double now = ZNet.instance.GetTimeSeconds();
+        float radiusSq = radius * radius;
+
+        List<ZDO> adults = _animals
+            .Where(z => z.IsValid() &&
+                (z.GetPosition() - center.Value)
+                    .sqrMagnitude <= radiusSq)
+            .OrderBy(z => z.GetPrefab())
+            .ThenBy(z =>
+                (z.GetPosition() - center.Value).sqrMagnitude)
+            .ToList();
+
+        List<ZDO> pups = _pups
+            .Where(z => z.IsValid() &&
+                (z.GetPosition() - center.Value)
+                    .sqrMagnitude <= radiusSq)
+            .ToList();
+
+        foreach (ZDO animal in _animals)
+            GetState(animal);
+
+        Print(output, "========== STE STATUS ==========");
+        Print(output, $"Search radius: {radius:0} m");
+        Print(output,
+            $"Adults: {adults.Count} | Seal pups: {pups.Count}");
+
+        foreach (Species s in _species.Where(x => x.Enabled.Value))
+        {
+            List<ZDO> group = adults
+                .Where(z => z.GetPrefab() == s.Hash)
+                .ToList();
+
+            List<ZDO> speciesPups = s.Prefab == "Seal"
+                ? pups
+                : new List<ZDO>();
+
+            if (group.Count == 0 && speciesPups.Count == 0)
+                continue;
+
+            int tamed = group.Count(z =>
+                z.GetBool(ZDOVars.s_tamed));
+
+            int pregnant = group.Count(z =>
+                z.GetBool(ZDOVars.s_tamed) &&
+                GetState(z).Pregnant > 0.0);
+
+            int physical = group.Count + speciesPups.Count;
+            int effective = physical + pregnant;
+
+            int max = s.MaxCreatures.Value >= 0
+                ? s.MaxCreatures.Value
+                : _maxCreatures.Value;
+
+            Print(output, $"----- {s.Prefab} -----");
+
+            Print(output,
+                $"Adults: {group.Count} | Tamed: {tamed} | " +
+                $"Wild: {group.Count - tamed} | " +
+                $"Pregnant: {pregnant}");
+
+            Print(output,
+                $"Physical population: {physical} | " +
+                $"Including pregnancies: {effective}");
+
+            Print(output,
+                $"Configured breeding limit: {max} " +
+                $"within {_populationRange.Value:0} m per animal");
+
+            string distribution = string.Join(", ",
+                group.Concat(speciesPups)
+                    .GroupBy(z => Mathf.Max(0,
+                        z.GetInt(ZDOVars.s_level, 1) - 1))
+                    .OrderBy(g => g.Key)
+                    .Select(g =>
+                        $"{g.Key}-star: {g.Count()}"));
+
+            Print(output, $"Star distribution: {distribution}");
+
+            if (s.Prefab == "Seal" &&
+                _enableSealStarUpgrades.Value &&
+                _selectiveSealStarBreeding.Value)
+            {
+                int highStars = group.Concat(speciesPups)
+                    .Count(z =>
+                        z.GetInt(ZDOVars.s_level, 1) >= 3);
+
+                Print(output,
+                    $"High-star seals in report: {highStars} | " +
+                    $"Configured local quota: " +
+                    $"{_sealMaxTwoStarSeals.Value}");
+            }
+
+            foreach (ZDO zdo in group)
+            {
+                State st = GetState(zdo);
+
+                bool isTamed = zdo.GetBool(ZDOVars.s_tamed);
+                bool fed = now < st.FedUntil;
+                bool calm = !_requireCalm.Value ||
+                    !zdo.GetBool(ZDOVars.s_alert);
+
+                int stars = Mathf.Max(0,
+                    zdo.GetInt(ZDOVars.s_level, 1) - 1);
+
+                float distance = Vector3.Distance(
+                    zdo.GetPosition(), center.Value);
+
+                float total = TamingSeconds(s);
+
+                float left = st.TameLeft < 0f
+                    ? total
+                    : Mathf.Clamp(st.TameLeft, 0f, total);
+
+                float tamingPercent = isTamed
+                    ? 100f
+                    : Mathf.Clamp01(1f - left / total) * 100f;
+
+                string foodStatus = fed
+                    ? $"Fed {Math.Max(0.0, st.FedUntil - now) / 60.0:0.00}m"
+                    : "Hungry";
+
+                string breedingStatus;
+
+                if (!isTamed)
+                {
+                    breedingStatus = !CanTame(zdo)
+                        ? "Taming blocked by star limit"
+                        : $"{left:0}s taming remaining";
+                }
+                else if (st.Pregnant > 0.0)
+                {
+                    double remaining = Math.Max(0.0,
+                        s.PregnancyMinutes.Value * 60.0 -
+                        (now - st.Pregnant));
+
+                    breedingStatus =
+                        $"Pregnant, {remaining / 60.0:0.00}m left";
+                }
+                else if (!s.Breeding.Value)
+                {
+                    breedingStatus = "Breeding disabled";
+                }
+                else if (!fed || !calm)
+                {
+                    breedingStatus = "Breeding paused";
+                }
+                else
+                {
+                    breedingStatus =
+                        Crowded(zdo, s, atBirth: false)
+                        ?? "Ready to breed";
+                }
+
+                Print(output,
+                    $"{s.Prefab} {zdo.m_uid} | " +
+                    $"{stars}-star | {distance:0.0}m | " +
+                    $"Taming {tamingPercent:0.0}% | " +
+                    $"{foodStatus} | " +
+                    $"{(calm ? "Calm" : "Alerted")} | " +
+                    $"Affection {st.Love}/" +
+                    $"{Mathf.Max(1, _requiredLovePoints.Value)} | " +
+                    breedingStatus);
+            }
+
+            foreach (ZDO pup in speciesPups)
+            {
+                int stars = Mathf.Max(0,
+                    pup.GetInt(ZDOVars.s_level, 1) - 1);
+
+                long born = pup.GetLong(KeyPupBorn, 0L);
+
+                string growth = born > 0L
+                    ? $"{Math.Max(0.0,
+                        Mathf.Max(1f, _sealPupGrowMinutes.Value)
+                        * 60.0 - (now - born / 1000.0))
+                        / 60.0:0.00}m until adulthood"
+                    : "No STE growth timestamp";
+
+                Print(output,
+                    $"Seal pup {pup.m_uid} | {stars}-star | " +
+                    $"{(pup.GetBool(ZDOVars.s_tamed)
+                        ? "Tamed" : "Wild")} | " +
+                    $"{Vector3.Distance(pup.GetPosition(),
+                        center.Value):0.0}m | {growth}");
+            }
+        }
+
+        Print(output,
+            $"Chest feeding: " +
+            $"{(_feeding.Containers ? "Enabled" : "Disabled")} | " +
+            $"Range: {_feeding.Range:0}m | " +
+            $"Eligible chests: {_chestRanges.Count}");
+
+        HashSet<int> allFoods = new HashSet<int>(
+            _species.SelectMany(x => x.FoodHashes));
+
+        foreach (ZDO chest in _chests
+            .Where(c => _chestRanges.ContainsKey(c.m_uid) &&
+                (c.GetPosition() - center.Value).sqrMagnitude
+                    <= radiusSq)
+            .OrderBy(c =>
+                (c.GetPosition() - center.Value).sqrMagnitude))
+        {
+            Print(output,
+                $"Feed chest {chest.m_uid} | " +
+                $"{Vector3.Distance(chest.GetPosition(),
+                    center.Value):0.0}m | " +
+                $"Range {_chestRanges[chest.m_uid]:0}m | " +
+                $"{(chest.GetBool(ZDOVars.s_inUse)
+                    ? "OPEN (skipped) | " : "")}" +
+                DescribeFood(chest, allFoods));
+        }
+
+        Print(output, "================================");
+
+        ZNetPeer caller = CallerPeer();
+
+        if (caller != null)
+        {
+            ZRoutedRpc.instance.InvokeRoutedRPC(
+                caller.m_uid,
+                "ShowMessage",
+                (int)MessageHud.MessageType.TopLeft,
+                $"STE: {adults.Count} adults, {pups.Count} pups. " +
+                "See F5 console for details.");
+        }
+    }
+
+    private static string DescribeFood(ZDO chest, HashSet<int> foods)
 	{
 		byte[] data = chest.GetByteArray(ZDOVars.s_items);
 		if (data == null || data.Length == 0)
@@ -1533,25 +2129,75 @@ public sealed class ServerTamingExtendedPlugin : BaseUnityPlugin
 		}
 	}
 
-	// ServerDevcommands remembers which admin sent the remote command; use it for the centre.
-	private static Vector3? CallerPosition()
-	{
-		Type type = AccessTools.TypeByName("ServerDevcommands.RedirectOutput");
-		if (!(type?.GetField("Target", BindingFlags.Static | BindingFlags.Public)?.GetValue(null) is ZRpc rpc))
-		{
-			return null;
-		}
-		ZNetPeer peer = ZNet.instance.GetPeers().FirstOrDefault(p => p.m_rpc == rpc);
-		return peer?.GetRefPos();
-	}
+    // Capture the requesting player's native remote command connection.
+    private static ZRpc _statusCaller;
 
-	private static void Print(Terminal output, string text)
-	{
-		// ServerDevcommands forwards console output to the caller unless it starts with '['.
-		(output ?? (Terminal)Console.instance)?.AddString(text);
-	}
+    [HarmonyPatch(typeof(ZNet), "RPC_RemoteCommand")]
+    private static class RemoteCommandPatch
+    {
+        private static void Prefix(ZRpc __0, string __1,
+            out ZRpc __state)
+        {
+            __state = _statusCaller;
 
-	private static string Format(Vector3 pos)
+            if (string.Equals(
+                __1?.Trim().Split(' ')[0],
+                "tamestatus",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                _statusCaller = __0;
+            }
+        }
+
+        private static Exception Finalizer(
+            Exception __exception, ZRpc __state)
+        {
+            _statusCaller = __state;
+            return __exception;
+        }
+    }
+
+    private static ZNetPeer CallerPeer()
+    {
+        if (_statusCaller == null || ZNet.instance == null)
+            return null;
+
+        return ZNet.instance.GetPeers()
+            .FirstOrDefault(p => p.m_rpc == _statusCaller);
+    }
+
+    private static Vector3? CallerPosition()
+    {
+        ZNetPeer peer = CallerPeer();
+
+        if (peer != null)
+            return peer.GetRefPos();
+
+        if (ZNet.instance != null &&
+            !ZNet.instance.IsDedicated())
+        {
+            return ZNet.instance.GetReferencePosition();
+        }
+
+        return null;
+    }
+
+    private void Print(Terminal output, string text)
+    {
+        // Always record command output, independently of DebugLog.
+        Logger.LogInfo($"[TAMESTATUS] {text}");
+
+        if (_statusCaller != null && ZNet.instance != null)
+        {
+            ZNet.instance.RemotePrint(_statusCaller, text);
+        }
+        else
+        {
+            (output ?? (Terminal)Console.instance)?.AddString(text);
+        }
+    }
+
+    private static string Format(Vector3 pos)
 	{
 		return $"({pos.x:0}, {pos.y:0}, {pos.z:0})";
 	}

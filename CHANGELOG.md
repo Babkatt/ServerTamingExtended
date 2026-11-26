@@ -5,6 +5,93 @@ All notable changes to ServerTamingExtended will be documented here.
 
 ServerTamingExtended is based on [ServerTaming by Shuiei](https://github.com/Shuiei/valheim-server-taming).
 
+## [1.2.1] - 2026-11-25
+
+### Fixed
+- Corrected a version mismatch between the compiled DLL's BepInEx plugin metadata and manifest.json.
+- No gameplay or functional changes from v1.2.0.
+
+## [1.2.0] - 2026-11-25
+
+### Added
+- Detailed, configurable diagnostic logging for taming, feeding, satiety, affection, breeding decisions, pregnancies, births, and seal pup maturation.
+- Ground food stack verification to confirm that individual food items are consumed correctly.
+- Chest inventory write verification to assist with troubleshooting container feeding.
+- Configurable diagnostic logging radius around connected players.
+- Optional logging of repeated unsuccessful food searches.
+- Expanded `tamestatus` command with detailed animal and population information:
+  - Adult and seal pup population counts.
+  - Tamed and wild creature counts.
+  - Star-level distribution and high-star population quota.
+  - Individual taming percentages and remaining taming time.
+  - Hunger status and remaining fed duration.
+  - Calm or alerted status.
+  - Affection points and breeding eligibility.
+  - Pregnancy status and remaining gestation time.
+  - Physical population and effective population including pregnancies.
+  - Seal pup maturation progress.
+  - Nearby feeding chests, feeding ranges, and available food quantities.
+
+### Changed
+- Detailed positional diagnostics are now restricted to a configurable distance around connected players.
+- Repeated unsuccessful food searches are suppressed by default.
+- Animal status diagnostics are recorded when an animal's status changes rather than on every update.
+- Diagnostic filtering does not affect animal simulation, taming, feeding, breeding, population counting, or maturation.
+- Basic taming completion, offspring birth, blocked birth, and maturation announcements remain logged regardless of diagnostic radius.
+- Existing unconditional warnings and errors remain unaffected.
+
+### Fixed
+- Fixed remote execution of the `tamestatus` command on dedicated servers.
+- Removed the command's dependency on ServerDevcommands being installed server-side.
+- Remote command output now uses Valheim's native remote command infrastructure.
+- Status reports are returned directly to the requesting player's F5 console.
+- Added a brief HUD notification confirming the number of nearby adults and pups.
+- Status reports are always recorded in the server log, independently of diagnostic logging settings.
+- Removed the previous 20-animal limit from status reports.
+
+### Configuration
+- Expanded `DebugLog` (default: false) to control detailed diagnostic logging.
+- Added `DebugLogRadius` (default: 15 metres; 0 disables distance filtering).
+- Added `LogHungryChecks` (default: false).
+
+### Commands
+- `server tamestatus [radius]` - Display detailed taming, breeding, population, and feeding information for nearby animals.
+- Default search radius: 30 metres.
+- Supported search radius: 1-100 metres.
+- Command output is independent of the configured diagnostic logging radius.
+
+### Compatibility
+- Tested with Valheim 1.0.30 (network version 42).
+- Verified taming, ground food stack consumption, chest feeding, affection accumulation, pregnancy, offspring births, and seal pup maturation.
+- Verified preservation of tame status and star levels through offspring birth, maturation, and server restarts.
+- Verified multigenerational seal breeding and offspring star upgrades.
+- Observed expected selective breeding behavior after reaching the configured high-star quota.
+- Verified population limit enforcement during both affection checks and offspring delivery.
+- Verified that completed pregnancies do not produce offspring when the local population limit is reached.
+- Existing Valheim Server UI Autofeed and ServersideQoL TameAssist integration retained.
+- Tested alongside ServersideQoL SmartDefense.
+- No ServerTamingExtended client installation required.
+
+### Damage and Aggression Testing
+- Tamed seals demonstrated protection against the following player damage sources under the tested Valheim 1.0.30 server configuration:
+  - Direct melee attacks.
+  - Crossbow projectiles.
+  - Ember bombs.
+  - Direct Staff of Embers attacks.
+  - Staff of Embers area-of-effect damage.
+  - Thunderblood Crossbow chain lightning.
+- Verified that ballistas configured with SmartDefense's `DontTargetTames` protection did not damage tamed seals during testing.
+- Verified normal hostile creature aggression toward custom tames when the Passive Enemies world modifier is disabled.
+- Verified that environmental fire continues to damage tamed seals, consistent with normal vanilla tame behavior.
+- No custom damage immunity, faction changes, or aggression overrides have been introduced.
+- The previously documented vulnerability of tamed seals to player attacks could not be reproduced under the tested server configuration.
+
+### Known Issues
+- Custom tames do not support vanilla petting, naming, or Follow/Stay interactions without additional client-side functionality.
+- Custom tames can trigger traps. Friendly-fire protection for traps remains subject to existing ServersideQoL SmartDefense limitations.
+- Custom tames remain vulnerable to hostile creatures and environmental hazards, consistent with normal vanilla tame behavior.
+
+
 ## [1.1.0] - 2026-11-09
 
 ### Added
